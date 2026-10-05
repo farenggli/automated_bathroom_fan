@@ -1,6 +1,6 @@
 blueprint:
-  name: "Badlüfter Steuerung: Event-basiert (Gefixt & Erweitert)"
-  description: "Startet nach Verlassen des Bades oder direkt bei Feuchtigkeitsanstieg ohne Anwesenheit. Bei normalem Aufenthalt feste Nachlaufzeit, bei hoher Feuchte bis zum Zielwert (max. Sicherheitslaufzeit). Pausiert bei Betreten."
+  name: "Badlüfter Steuerung: Event-basiert (Gefixt)"
+  description: "Startet nach Verlassen des Bades. Bei normalem Aufenthalt feste Nachlaufzeit, bei hoher Feuchte bis zum Zielwert (max. Sicherheitslaufzeit). Pausiert bei Betreten."
   domain: automation
   input:
     presence_sensor:
@@ -102,9 +102,9 @@ variables:
   std_time: !input standard_run_time
   max_time: !input max_run_time
   delay_sec: !input off_delay
-  presence_ent: !input presence_sensor
 
 trigger:
+  # 1. Ausreichend lange im Bad aufgehalten (WC / normales Fertigmachen)
   - platform: state
     entity_id: !input presence_sensor
     to: "on"
@@ -112,6 +112,7 @@ trigger:
       minutes: !input min_stay_duration
     id: zeit_erreicht
 
+  # 2. Feuchtigkeit schlagartig angestiegen (Duschen)
   - platform: template
     value_template: >
       {% if bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
@@ -122,20 +123,17 @@ trigger:
     id: feuchte_hoch
 
 action:
-  - choose:
-      - conditions:
-          - condition: template
-            value_template: "{{ trigger.id == 'zeit_erreicht' or is_state(presence_ent, 'on') }}"
-        sequence:
-          - wait_for_trigger:
-              - platform: state
-                entity_id: !input presence_sensor
-                to: "off"
-                for:
-                  seconds: !input off_delay
-            timeout: "03:00:00"
-            continue_on_timeout: false
+  # 1. Warten, bis das Bad verlassen wurde
+  - wait_for_trigger:
+      - platform: state
+        entity_id: !input presence_sensor
+        to: "off"
+        for:
+          seconds: !input off_delay
+    timeout: "02:00:00"
+    continue_on_timeout: false
 
+  # 2. Prüfen, ob Duschen/Feuchtigkeit der Grund war
   - variables:
       is_shower: >
         {% if trigger.id == 'feuchte_hoch' %}
@@ -145,24 +143,64 @@ action:
         {% else %}
           {{ false }}
         {% endif %}
+      # NEU: Berechnet den fixen End-Zeitpunkt als UNIX-Timestamp
       run_duration_min: "{{ (max_time if (is_shower | bool) else std_time) | int(10) }}"
       stop_timestamp: "{{ as_timestamp(now()) + (run_duration_min * 60) }}"
 
+  # 3. Lüfter einschalten
   - action: homeassistant.turn_on
     target: !input fan_switch
 
+  # 4. Ereignisbasiertes Warten (Schleife)
   - repeat:
       sequence:
         - wait_for_trigger:
+            # Event A: Jemand betritt das Bad wieder (Pause)
             - platform: state
               entity_id: !input presence_sensor
               to: "on"
               id: wieder_betreten
+            # Event B: Feuchte-Zielwert erreicht (nur wenn geduscht wurde)
             - platform: template
               value_template: >
                 {% if is_shower | bool and bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
-                  {{ states(bad_sensor) | float(0) 
-               {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
+                  {{ states(bad_sensor) | float(0) <= (states(ref_sensor) | float(0) + (d_off | float(3))) }}
+                {% else %}
+                  false
+                {% endif %}
+              for:
+                minutes: 1
+              id: ziel_erreicht
+          # NEU: Berechnet die verbleibenden Sekunden dynamisch. Mindestens 1 Sekunde.
+          timeout: "{{ [1, (stop_timestamp | float - as_timestamp(now())) | int] | max }}"
+          continue_on_timeout: true
 
+        # Reaktionen auf Events
+        - choose:
+            # Fall A: Person betritt Bad -> Lüfter aus, warten bis wieder leer, Lüfter an
+            - conditions:
+                - condition: template
+                  value_template: "{{ wait.trigger is not none and wait.trigger.id == 'wieder_betreten' }}"
+              sequence:
+                - action: homeassistant.turn_off
+                  target: !input fan_switch
+                - wait_for_trigger:
+                    - platform: state
+                      entity_id: !input presence_sensor
+                      to: "off"
+                      for:
+                        seconds: !input off_delay
+                  timeout: "01:00:00"
+                  continue_on_timeout: false
+                - action: homeassistant.turn_on
+                  target: !input fan_switch
+
+      # Schleife beendet sich, wenn die Zeit abgelaufen ist ODER der Zielwert erreicht wurde
+      until:
+        - condition: template
+          value_template: >
+            {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
+
+  # 5. Lüfter am Ende zuverlässig ausschalten
   - action: homeassistant.turn_off
     target: !input fan_switch
