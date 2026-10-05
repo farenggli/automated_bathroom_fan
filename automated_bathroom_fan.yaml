@@ -162,7 +162,7 @@ action:
               value_template: >
                 {% if is_shower | bool and bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
                   {{ states(bad_sensor) | float(0) 
-            {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
+               {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
 
   - action: homeassistant.turn_off
     target: !input fan_switch
