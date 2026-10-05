@@ -1,0 +1,206 @@
+blueprint:
+  name: "Badlüfter Steuerung: Event-basiert (Gefixt)"
+  description: "Startet nach Verlassen des Bades. Bei normalem Aufenthalt feste Nachlaufzeit, bei hoher Feuchte bis zum Zielwert (max. Sicherheitslaufzeit). Pausiert bei Betreten."
+  domain: automation
+  input:
+    presence_sensor:
+      name: mmWave Präsenzmelder
+      description: Der Präsenzmelder / Bewegungsmelder im Badezimmer.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: [presence, motion, occupancy]
+    fan_switch:
+      name: Lüfter Schalter
+      description: Der Schalter / das Relais des Badlüfters.
+      selector:
+        target:
+          entity:
+            domain: [switch, fan]
+    min_stay_duration:
+      name: Mindest-Aufenthaltsdauer (Minuten)
+      description: Wie lange muss man im Bad sein, um den Standard-Nachlauf auszulösen?
+      default: 4
+      selector:
+        number:
+          min: 1
+          max: 30
+          unit_of_measurement: "min"
+          mode: slider
+    standard_run_time:
+      name: Feste Nachlaufzeit ohne Duschen (Minuten)
+      description: Wie lange soll der Lüfter nach reinem Aufenthalt/WC laufen?
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: "min"
+          mode: slider
+    max_run_time:
+      name: Maximale Nachlaufzeit bei Duschen (Minuten)
+      description: Nach wie vielen Minuten soll bei hoher Feuchte spätestens abgebrochen werden?
+      default: 25
+      selector:
+        number:
+          min: 5
+          max: 90
+          unit_of_measurement: "min"
+          mode: slider
+    off_delay:
+      name: Verzögerung nach Verlassen (Sekunden)
+      description: Wartezeit nach Verlassen, bevor der Lüfter anspringt.
+      default: 45
+      selector:
+        number:
+          min: 5
+          max: 300
+          unit_of_measurement: "s"
+          mode: slider
+    humidity_sensor:
+      name: (Optional) Bad Feuchtigkeitssensor
+      default: []
+      selector:
+        entity:
+          domain: sensor
+          device_class: humidity
+    reference_sensor:
+      name: (Optional) Referenz Feuchtigkeitssensor
+      default: []
+      selector:
+        entity:
+          domain: sensor
+          device_class: humidity
+    delta_trigger:
+      name: (Optional) Feuchte-Auslöser Delta (%)
+      default: 8
+      selector:
+        number:
+          min: 2
+          max: 30
+          unit_of_measurement: "%"
+          mode: slider
+    delta_off:
+      name: (Optional) Feuchte-Abschalt Delta (%)
+      description: Schaltet ab, wenn Badfeuchte unter Referenz + dieser Wert fällt.
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 15
+          unit_of_measurement: "%"
+          mode: slider
+
+mode: single
+max_exceeded: silent
+
+variables:
+  bad_sensor: !input humidity_sensor
+  ref_sensor: !input reference_sensor
+  d_trigger: !input delta_trigger
+  d_off: !input delta_off
+  std_time: !input standard_run_time
+  max_time: !input max_run_time
+  delay_sec: !input off_delay
+
+trigger:
+  # 1. Ausreichend lange im Bad aufgehalten (WC / normales Fertigmachen)
+  - platform: state
+    entity_id: !input presence_sensor
+    to: "on"
+    for:
+      minutes: !input min_stay_duration
+    id: zeit_erreicht
+
+  # 2. Feuchtigkeit schlagartig angestiegen (Duschen)
+  - platform: template
+    value_template: >
+      {% if bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
+        {{ states(bad_sensor) | float(0) > (states(ref_sensor) | float(0) + (d_trigger | float(0))) }}
+      {% else %}
+        false
+      {% endif %}
+    id: feuchte_hoch
+
+action:
+  # 1. Warten, bis das Bad verlassen wurde
+  - wait_for_trigger:
+      - platform: state
+        entity_id: !input presence_sensor
+        to: "off"
+        for:
+          seconds: !input off_delay
+    timeout: "02:00:00"
+    continue_on_timeout: false
+
+  # 2. Prüfen, ob Duschen/Feuchtigkeit der Grund war
+  - variables:
+      is_shower: >
+        {% if trigger.id == 'feuchte_hoch' %}
+          {{ true }}
+        {% elif bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
+          {{ states(bad_sensor) | float(0) > (states(ref_sensor) | float(0) + (d_trigger | float(8))) }}
+        {% else %}
+          {{ false }}
+        {% endif %}
+      # NEU: Berechnet den fixen End-Zeitpunkt als UNIX-Timestamp
+      run_duration_min: "{{ (max_time if (is_shower | bool) else std_time) | int(10) }}"
+      stop_timestamp: "{{ as_timestamp(now()) + (run_duration_min * 60) }}"
+
+  # 3. Lüfter einschalten
+  - action: homeassistant.turn_on
+    target: !input fan_switch
+
+  # 4. Ereignisbasiertes Warten (Schleife)
+  - repeat:
+      sequence:
+        - wait_for_trigger:
+            # Event A: Jemand betritt das Bad wieder (Pause)
+            - platform: state
+              entity_id: !input presence_sensor
+              to: "on"
+              id: wieder_betreten
+            # Event B: Feuchte-Zielwert erreicht (nur wenn geduscht wurde)
+            - platform: template
+              value_template: >
+                {% if is_shower | bool and bad_sensor and ref_sensor and states(bad_sensor) not in ['unknown', 'unavailable'] and states(ref_sensor) not in ['unknown', 'unavailable'] %}
+                  {{ states(bad_sensor) | float(0) <= (states(ref_sensor) | float(0) + (d_off | float(3))) }}
+                {% else %}
+                  false
+                {% endif %}
+              for:
+                minutes: 1
+              id: ziel_erreicht
+          # NEU: Berechnet die verbleibenden Sekunden dynamisch. Mindestens 1 Sekunde.
+          timeout: "{{ [1, (stop_timestamp | float - as_timestamp(now())) | int] | max }}"
+          continue_on_timeout: true
+
+        # Reaktionen auf Events
+        - choose:
+            # Fall A: Person betritt Bad -> Lüfter aus, warten bis wieder leer, Lüfter an
+            - conditions:
+                - condition: template
+                  value_template: "{{ wait.trigger is not none and wait.trigger.id == 'wieder_betreten' }}"
+              sequence:
+                - action: homeassistant.turn_off
+                  target: !input fan_switch
+                - wait_for_trigger:
+                    - platform: state
+                      entity_id: !input presence_sensor
+                      to: "off"
+                      for:
+                        seconds: !input off_delay
+                  timeout: "01:00:00"
+                  continue_on_timeout: false
+                - action: homeassistant.turn_on
+                  target: !input fan_switch
+
+      # Schleife beendet sich, wenn die Zeit abgelaufen ist ODER der Zielwert erreicht wurde
+      until:
+        - condition: template
+          value_template: >
+            {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
+
+  # 5. Lüfter am Ende zuverlässig ausschalten
+  - action: homeassistant.turn_off
+    target: !input fan_switch
