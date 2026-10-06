@@ -90,10 +90,8 @@ blueprint:
           max: 15
           unit_of_measurement: "%"
           mode: slider
-
 mode: single
 max_exceeded: silent
-
 variables:
   bad_sensor: !input humidity_sensor
   ref_sensor: !input reference_sensor
@@ -102,7 +100,6 @@ variables:
   std_time: !input standard_run_time
   max_time: !input max_run_time
   delay_sec: !input off_delay
-
 trigger:
   # 1. Ausreichend lange im Bad aufgehalten (WC / normales Fertigmachen)
   - platform: state
@@ -111,7 +108,6 @@ trigger:
     for:
       minutes: !input min_stay_duration
     id: zeit_erreicht
-
   # 2. Feuchtigkeit schlagartig angestiegen (Duschen)
   - platform: template
     value_template: >
@@ -121,7 +117,6 @@ trigger:
         false
       {% endif %}
     id: feuchte_hoch
-
 action:
   # 1. Warten, bis das Bad verlassen wurde
   - wait_for_trigger:
@@ -132,7 +127,6 @@ action:
           seconds: !input off_delay
     timeout: "02:00:00"
     continue_on_timeout: false
-
   # 2. Prüfen, ob Duschen/Feuchtigkeit der Grund war
   - variables:
       is_shower: >
@@ -146,11 +140,9 @@ action:
       # NEU: Berechnet den fixen End-Zeitpunkt als UNIX-Timestamp
       run_duration_min: "{{ (max_time if (is_shower | bool) else std_time) | int(10) }}"
       stop_timestamp: "{{ as_timestamp(now()) + (run_duration_min * 60) }}"
-
   # 3. Lüfter einschalten
   - action: homeassistant.turn_on
     target: !input fan_switch
-
   # 4. Ereignisbasiertes Warten (Schleife)
   - repeat:
       sequence:
@@ -174,7 +166,6 @@ action:
           # NEU: Berechnet die verbleibenden Sekunden dynamisch. Mindestens 1 Sekunde.
           timeout: "{{ [1, (stop_timestamp | float - as_timestamp(now())) | int] | max }}"
           continue_on_timeout: true
-
         # Reaktionen auf Events
         - choose:
             # Fall A: Person betritt Bad -> Lüfter aus, warten bis wieder leer, Lüfter an
@@ -194,13 +185,11 @@ action:
                   continue_on_timeout: false
                 - action: homeassistant.turn_on
                   target: !input fan_switch
-
       # Schleife beendet sich, wenn die Zeit abgelaufen ist ODER der Zielwert erreicht wurde
       until:
         - condition: template
           value_template: >
             {{ wait.trigger is none or wait.trigger.id == 'ziel_erreicht' or as_timestamp(now()) >= stop_timestamp | float }}
-
   # 5. Lüfter am Ende zuverlässig ausschalten
   - action: homeassistant.turn_off
     target: !input fan_switch
